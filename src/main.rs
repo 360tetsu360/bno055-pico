@@ -4,8 +4,10 @@
 #![no_std]
 #![no_main]
 
-use bsp::entry;
-use defmt::*;
+use bsp::{
+    entry,
+    hal::{gpio, uart, I2C},
+};
 use defmt_rtt as _;
 use embedded_hal::digital::v2::OutputPin;
 use panic_probe as _;
@@ -22,9 +24,12 @@ use bsp::hal::{
     watchdog::Watchdog,
 };
 
+use core::fmt::Write;
+
+use fugit::RateExtU32;
+
 #[entry]
 fn main() -> ! {
-    info!("Program start");
     let mut pac = pac::Peripherals::take().unwrap();
     let core = pac::CorePeripherals::take().unwrap();
     let mut watchdog = Watchdog::new(pac.WATCHDOG);
@@ -53,15 +58,67 @@ fn main() -> ! {
         &mut pac.RESETS,
     );
 
-    let mut led_pin = pins.led.into_push_pull_output();
+    let mut uart_on = pins.gpio22.into_push_pull_output();
 
-    loop {
-        info!("on!");
+    let mut led_pin = pins.led.into_push_pull_output();
+    for _ in 0..3 {
         led_pin.set_high().unwrap();
         delay.delay_ms(500);
-        info!("off!");
         led_pin.set_low().unwrap();
         delay.delay_ms(500);
+    }
+
+    // Initialize uart for debug
+    let uart_pins = (
+        pins.gpio0.into_mode::<gpio::FunctionUart>(),
+        pins.gpio1.into_mode::<gpio::FunctionUart>(),
+    );
+
+    let mut uart = uart::UartPeripheral::new(pac.UART0, uart_pins, &mut pac.RESETS)
+        .enable(
+            uart::common_configs::_115200_8_N_1,
+            clocks.peripheral_clock.freq(),
+        )
+        .unwrap();
+
+    uart_on.set_high().unwrap();
+    uart.write_str("\n").unwrap();
+    uart.write_str("UART start\n").unwrap();
+
+    // Initialize bno055
+    let sda_pin = pins.gpio16.into_mode::<gpio::FunctionI2C>();
+    let scl_pin = pins.gpio17.into_mode::<gpio::FunctionI2C>();
+    let i2c = I2C::i2c0(
+        pac.I2C0,
+        sda_pin,
+        scl_pin, // Try `not_an_scl_pin` here
+        400_u32.kHz(),
+        &mut pac.RESETS,
+        clocks.system_clock.freq(),
+    );
+
+    let mut imu = bno055::Bno055::new(i2c).with_alternative_address();
+    imu.init(&mut delay).unwrap_or_else(|_| {
+        uart.write_full_blocking(b"An error occurred while building the IMU\n")
+    });
+    imu.set_external_crystal(true, &mut delay).unwrap();
+    imu.set_mode(bno055::BNO055OperationMode::IMU, &mut delay)
+        .unwrap_or_else(|_| {
+            uart.write_full_blocking(b"An error occurred while building the IMU\n")
+        });
+
+    uart.write_str("BNO055 initialized!\n").unwrap();
+
+    loop {
+        if let Ok(is_calibrated) = imu.is_fully_calibrated() {
+            if is_calibrated {
+                uart.write_str("calibrated.\n").unwrap();
+                if let Ok(calib_profile) = imu.calibration_profile(&mut delay) {
+                    let _ = imu.set_calibration_profile(calib_profile, &mut delay);
+                }
+            }
+        }
+        delay.delay_ms(1000);
     }
 }
 
